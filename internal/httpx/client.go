@@ -1,10 +1,7 @@
 package httpx
 
-import (
-	"fmt"
-	"runtime"
-)
-
+// UserAgent mirrors the official OpenCode CLI identity string:
+// opencode/<channel>/<version>/<name>. Stable releases use channel "latest".
 func UserAgent() string {
-	return fmt.Sprintf("opencode/1.18.31 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return "opencode/latest/1.19.0/cli"
 }

@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"time"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -101,7 +102,14 @@ func CanonicalSessionID(signal string) string {
 		return signal
 	}
 	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	timePart := hex.EncodeToString(sum[:6])
+	// Official clients encode ~(millis<<12 + counter) as 6 big-endian hex
+	// bytes; use a fresh timestamp so freshness checks see a live session.
+	value := ^(time.Now().UnixMilli() * 0x1000)
+	var tb [6]byte
+	for i := 0; i < 6; i++ {
+		tb[i] = byte(value >> (40 - 8*i))
+	}
+	timePart := hex.EncodeToString(tb[:])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
 	return "ses_" + timePart + randomPart
 }

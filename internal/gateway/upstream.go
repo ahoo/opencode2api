@@ -806,6 +806,7 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", httpx.UserAgent())
 	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-session-id", ids.Session)
 	req.Header.Set("x-opencode-session", ids.Session)
 	// OpenCode 1.18.x sends these correlation headers to preserve provider-side
 	// prompt/session affinity. Keep the legacy x-opencode-session header too so
