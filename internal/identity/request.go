@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/jsonutil"
@@ -54,7 +55,7 @@ func DeriveRequestIDs(r *http.Request, body map[string]any) RequestIDs {
 	)
 	return RequestIDs{
 		Session:       session,
-		Request:       RandomID("req", 16),
+		Request:       OpenCodeMessageID(),
 		Project:       StableID("prj", projectSignal),
 		ParentSession: parentSession,
 	}
@@ -131,4 +132,35 @@ func RandomID(prefix string, size int) string {
 		panic(fmt.Sprintf("crypto/rand failed: %v", err))
 	}
 	return prefix + "_" + hex.EncodeToString(buf)
+}
+
+// msgIDCounter mirrors OpenCode's per-process message counter so IDs minted
+// within the same millisecond stay unique.
+var msgIDCounter uint64
+
+// OpenCodeMessageID mints a valid OpenCode ascending message identifier:
+// "msg_" + 12 lowercase hex timestamp characters + 14 Base62 characters.
+// The Zen free tier (inference front door) rejects malformed
+// x-opencode-request values with 403 FreeTierError; the legacy "req_<hex>"
+// shape never passes. Encoding mirrors Identifier.ascending("message"):
+// millis*0x1000 + counter as 6 big-endian bytes, plus a crypto-random
+// suffix. Generated from the current time, so it never needs updating when
+// OpenCode releases a new version.
+func OpenCodeMessageID() string {
+	ms := time.Now().UnixMilli()
+	c := atomic.AddUint64(&msgIDCounter, 1) & 0xFFF
+	now := ms*0x1000 + int64(c)
+	var tb [6]byte
+	for i := 0; i < 6; i++ {
+		tb[i] = byte(now >> (40 - 8*i))
+	}
+	rb := make([]byte, 14)
+	if _, err := rand.Read(rb); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	sb := make([]byte, 14)
+	for i, b := range rb {
+		sb[i] = base62Alphabet[b%62]
+	}
+	return "msg_" + hex.EncodeToString(tb[:]) + string(sb)
 }

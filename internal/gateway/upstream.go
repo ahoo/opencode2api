@@ -253,6 +253,24 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	return nil, effectiveRoute, attempts, lastErr
 }
 
+// anonymousUpstreamBase returns the front door for keyless Zen traffic.
+// The legacy /zen front door rejects anonymous free-tier requests with 403
+// FreeTierError even when identity headers and body are valid; the official
+// OpenCode client sends keyless traffic to /inference instead. Derived from
+// the configured zen base so it stays config-driven (a base already pointing
+// at /inference is used as-is); keyed tiers keep using the configured base
+// untouched.
+func (g *Gateway) anonymousUpstreamBase() string {
+	base := strings.TrimRight(g.cfg.Upstream.Zen, "/")
+	if strings.HasSuffix(base, "/inference") {
+		return base
+	}
+	if strings.HasSuffix(base, "/zen") {
+		return strings.TrimSuffix(base, "/zen") + "/inference"
+	}
+	return base
+}
+
 // doAnonymousUpstream tries every currently available proxy at most once. Any
 // failure, including an HTTP error response, advances to the next proxy. Only a
 // successful response ends the anonymous phase; exhausting the proxy cursor
@@ -296,7 +314,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, route.Protocol, body, ids, anonymousZenKey)
+		req, err := newUpstreamRequest(ctx, g.anonymousUpstreamBase(), route.Protocol, body, ids, anonymousZenKey)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -337,18 +355,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	return nil, lastErr, attempts
 }
 
-// anonymousCoreTools are the tool names the anonymous free tier expects on
-// an agent-shaped request. Requests without them are rejected with 403
-// FreeTierError. Only the names matter; the gateway synthesizes minimal
-// definitions for whichever ones the downstream client did not declare.
-var anonymousCoreTools = []string{"bash", "edit", "glob", "grep", "read"}
-
 // prepareAnonymousBody returns a copy of body normalized for the anonymous
-// free tier: streaming enabled plus the core agent tools present. Bodies
-// that already satisfy both (or are not JSON objects) are returned
-// unchanged. System One payloads are decision requests, not agent traffic, so
-// they are forwarded verbatim; injecting streaming or tool definitions would
-// make the upstream reject them.
+// free tier: streaming enabled (anything else is rejected with 403
+// FreeTierError). Tool definitions are forwarded verbatim from the downstream
+// client; synthesizing fake tool stubs poisons the request (the inference
+// front door rejects them with 403). System One payloads are decision
+// requests, not agent traffic, so they are forwarded verbatim; injecting
+// streaming would make the upstream reject them.
 func prepareAnonymousBody(body []byte, protocol wire.Protocol) []byte {
 	if protocol == wire.SystemOne {
 		return body
@@ -363,9 +376,6 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol) []byte {
 		changed = true
 	}
 	if ensureAnonymousChatUsage(payload, protocol) {
-		changed = true
-	}
-	if ensureAnonymousTools(payload, protocol) {
 		changed = true
 	}
 	if !changed {
@@ -396,90 +406,6 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 	}
 	options["include_usage"] = true
 	return true
-}
-
-// ensureAnonymousTools appends minimal definitions for any missing core
-// tool so the request reads as an agent session upstream. It reports
-// whether the payload changed. Tools the client already declared are left
-// untouched.
-func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
-	raw, exists := payload["tools"]
-	if !exists {
-		payload["tools"] = anonymousToolset(protocol, nil)
-		return true
-	}
-	items, ok := raw.([]any)
-	if !ok {
-		return false
-	}
-	present := make(map[string]bool, len(items))
-	for _, item := range items {
-		if name := anonymousToolName(protocol, item); name != "" {
-			present[name] = true
-		}
-	}
-	missing := make([]string, 0, len(anonymousCoreTools))
-	for _, name := range anonymousCoreTools {
-		if !present[name] {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) == 0 {
-		return false
-	}
-	payload["tools"] = append(items, anonymousToolset(protocol, missing)...)
-	return true
-}
-
-func anonymousToolName(protocol wire.Protocol, item any) string {
-	entry, ok := item.(map[string]any)
-	if !ok {
-		return ""
-	}
-	if protocol == wire.Chat {
-		return jsonutil.StringAt(entry, "function", "name")
-	}
-	return jsonutil.StringAt(entry, "name")
-}
-
-func anonymousToolset(protocol wire.Protocol, names []string) []any {
-	if names == nil {
-		names = anonymousCoreTools
-	}
-	tools := make([]any, 0, len(names))
-	for _, name := range names {
-		tools = append(tools, anonymousTool(protocol, name))
-	}
-	return tools
-}
-
-func anonymousTool(protocol wire.Protocol, name string) map[string]any {
-	description := "Agent tool " + name
-	parameters := map[string]any{"type": "object", "properties": map[string]any{}}
-	switch protocol {
-	case wire.Chat:
-		return map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        name,
-				"description": description,
-				"parameters":  parameters,
-			},
-		}
-	case wire.Anthropic:
-		return map[string]any{
-			"name":         name,
-			"description":  description,
-			"input_schema": parameters,
-		}
-	default:
-		return map[string]any{
-			"type":        "function",
-			"name":        name,
-			"description": description,
-			"parameters":  parameters,
-		}
-	}
 }
 
 // requestBodyDumpLimit caps how much of an outbound body is written to the log.
@@ -808,13 +734,23 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session-id", ids.Session)
 	req.Header.Set("x-opencode-session", ids.Session)
-	// OpenCode 1.18.x sends these correlation headers to preserve provider-side
-	// prompt/session affinity. Keep the legacy x-opencode-session header too so
-	// older Zen deployments continue to recognize the request.
-	req.Header.Set("x-session-affinity", ids.Session)
-	req.Header.Set("X-Session-Id", ids.Session)
+	// The /inference front door rejects the legacy affinity aliases outright
+	// (403 FreeTierError); the official built-in client only sends the two
+	// x-opencode-session headers above. Keep the aliases for keyed lanes that
+	// still talk to older deployments, and omit them on the anonymous lane.
+	if key != anonymousZenKey {
+		req.Header.Set("x-session-affinity", ids.Session)
+		req.Header.Set("X-Session-Id", ids.Session)
+	}
 	req.Header.Set("x-opencode-request", ids.Request)
-	req.Header.Set("x-opencode-project", ids.Project)
+	// The inference front door only accepts the default project scope on the
+	// anonymous lane (a hashed prj_ value is rejected with 403 FreeTierError).
+	// The official client sends "global" when no workspace project is active.
+	project := ids.Project
+	if key == anonymousZenKey {
+		project = "global"
+	}
+	req.Header.Set("x-opencode-project", project)
 	if ids.ParentSession != "" {
 		req.Header.Set("x-parent-session-id", ids.ParentSession)
 	}
